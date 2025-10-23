@@ -140,7 +140,7 @@ def save_to_db(nombre: str, cedula: str, values: List[Any]) -> None:
 # ==========================
 # Usamos tus funciones de score_results.py
 # Asegúrate de que score_results.py esté en el mismo directorio del proyecto.
-from score_results import score_df  # devuelve (scored_df, reliability_dict)
+from score_results import score_df, aggregate_summary  # devuelve (scored_df, reliability_dict)
 
 def load_all_from_db() -> pd.DataFrame:
     q = "SELECT * FROM respuestas ORDER BY timestamp_utc ASC;"
@@ -230,36 +230,35 @@ with gr.Blocks(title=TITLE, theme=gr.themes.Soft()) as app:
             outputs=[nombre, cedula] + question_components + [status],
         )
 
+    
+    # ==========================================================
+    #   PANEL ADMINISTRATIVO (Gradio)
+    # ==========================================================
     with gr.Tab("Panel Administrativo"):
         gr.Markdown("### 🔒 Acceso restringido")
         pwd = gr.Textbox(label="Contraseña de administrador", type="password")
         enter_btn = gr.Button("Entrar")
         admin_status = gr.Markdown()
 
-        # Contenedores de datos/plots
+        # Contenedor visible solo tras login exitoso
         with gr.Group(visible=False) as admin_block:
             gr.Markdown("#### 👥 Respuestas registradas")
-            df_users = gr.Dataframe(
-                headers=None, interactive=False, wrap=True, label="Respuestas (raw)"
-            )
+            df_users = gr.Dataframe(label="Respuestas (raw)", wrap=True, interactive=False)
 
-            gr.Markdown("#### 📊 Calificaciones (por usuario)")
-            df_scored = gr.Dataframe(
-                headers=None, interactive=False, wrap=True, label="Resultados con puntajes"
-            )
+            gr.Markdown("#### 📊 Calificaciones por usuario")
+            df_scored = gr.Dataframe(label="Resultados con puntajes", wrap=True, interactive=False)
 
             with gr.Row():
-                bar_avg = gr.BarPlot(
-                    x="escala", y="porcentaje", title="Promedio por escala (%)", height=320
-                )
-                bar_per_user = gr.BarPlot(
-                    x="nombre", y="porcentaje", color="escala",
-                    title="Puntajes por usuario y escala (%)", height=320
-                )
+                bar_avg = gr.BarPlot(x="escala", y="porcentaje", title="Promedio por escala (%)", height=300)
+                bar_per_user = gr.BarPlot(x="nombre", y="porcentaje", color="escala",
+                                        title="Puntajes por usuario y escala (%)", height=300)
 
-            download_file = gr.File(label="Descargar calificaciones (CSV)", visible=False)
+            download_file = gr.File(label="Descargar CSV de resultados", visible=False)
             refresh_btn = gr.Button("Actualizar datos")
 
+        # ======================================================
+        #   Login de administrador
+        # ======================================================
         def admin_login(p):
             admin_pass = os.getenv("ADMIN_PASSWORD", "")
             if not admin_pass:
@@ -270,43 +269,57 @@ with gr.Blocks(title=TITLE, theme=gr.themes.Soft()) as app:
 
         enter_btn.click(admin_login, inputs=[pwd], outputs=[admin_status, admin_block])
 
+        # ======================================================
+        #   Carga de datos y generación de gráficos
+        # ======================================================
         def load_admin_data(_evt=None):
-            # Cargar respuestas
-            df = load_all_from_db()
+            query = "SELECT * FROM respuestas ORDER BY timestamp_utc DESC;"
+            df = pd.read_sql(query, con=engine)
+
             if df.empty:
-                # limpiar vistas
                 return (
                     "No hay respuestas aún.",
-                    gr.update(value=pd.DataFrame()),
-                    gr.update(value=pd.DataFrame()),
-                    gr.update(value=pd.DataFrame(columns=["escala","porcentaje"])),
-                    gr.update(value=pd.DataFrame(columns=["nombre","escala","porcentaje"])),
+                    pd.DataFrame(),
+                    pd.DataFrame(),
+                    pd.DataFrame(columns=["escala", "porcentaje"]),
+                    pd.DataFrame(columns=["nombre", "escala", "porcentaje"]),
                     gr.update(visible=False, value=None),
                 )
 
-            # Calcular puntajes
-            scored, _reliab = score_df(df)
+            # Normalizar nombres de columnas
+            df.rename(columns={c: c.upper() for c in df.columns if c.startswith(("a", "f", "p"))}, inplace=True)
 
-            # CSV temporal para descarga
-            csv_path = "/tmp/resultados_scoring.csv"
+            # Calcular resultados
+            scored, _ = score_df(df)
+
+            # CSV temporal
+            csv_path = os.path.join(os.getcwd(), "resultados_scoring.csv")
+
             scored.to_csv(csv_path, index=False, encoding="utf-8")
 
-            # Graficar
-            avg_df = build_aggregate_bars(scored)
-            per_user_df = build_per_user_bars(scored)
+            # Agregados
+            avg_summary = aggregate_summary(scored)
+            avg_df = avg_summary[avg_summary["metric"].str.endswith("_porc")].rename(columns={"metric": "escala", "value": "porcentaje"})
+            per_user_df = scored.melt(
+                id_vars=["nombre"],
+                value_vars=["Logros_porc", "Afiliación_porc", "Poder_porc"],
+                var_name="escala",
+                value_name="porcentaje"
+            )
 
             return (
                 f"✅ {len(df)} respuestas cargadas.",
-                df,                         # tabla raw
-                scored,                     # tabla con puntajes
-                avg_df,                     # barras promedio
-                per_user_df,                # barras por usuario
+                df,
+                scored,
+                avg_df,
+                per_user_df,
                 gr.update(visible=True, value=csv_path),
             )
 
-        # Cargar datos al entrar y al refrescar
-        enter_btn.click(load_admin_data, outputs=[admin_status, df_users, df_scored, bar_avg, bar_per_user, download_file])
-        refresh_btn.click(load_admin_data, outputs=[admin_status, df_users, df_scored, bar_avg, bar_per_user, download_file])
+        enter_btn.click(load_admin_data,
+                        outputs=[admin_status, df_users, df_scored, bar_avg, bar_per_user, download_file])
+        refresh_btn.click(load_admin_data,
+                        outputs=[admin_status, df_users, df_scored, bar_avg, bar_per_user, download_file])
 
 # ==========================
 #   Launcher
