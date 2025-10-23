@@ -11,6 +11,7 @@ from typing import List, Tuple, Dict, Any
 from dotenv import load_dotenv
 load_dotenv()
 
+import plotly.graph_objects as go
 
 import pandas as pd
 import numpy as np
@@ -230,7 +231,6 @@ with gr.Blocks(title=TITLE, theme=gr.themes.Soft()) as app:
             outputs=[nombre, cedula] + question_components + [status],
         )
 
-    
     # ==========================================================
     #   PANEL ADMINISTRATIVO (Gradio)
     # ==========================================================
@@ -240,7 +240,7 @@ with gr.Blocks(title=TITLE, theme=gr.themes.Soft()) as app:
         enter_btn = gr.Button("Entrar")
         admin_status = gr.Markdown()
 
-        # Contenedor visible solo tras login exitoso
+        # Contenedor principal (oculto hasta login correcto)
         with gr.Group(visible=False) as admin_block:
             gr.Markdown("#### 👥 Respuestas registradas")
             df_users = gr.Dataframe(label="Respuestas (raw)", wrap=True, interactive=False)
@@ -249,12 +249,18 @@ with gr.Blocks(title=TITLE, theme=gr.themes.Soft()) as app:
             df_scored = gr.Dataframe(label="Resultados con puntajes", wrap=True, interactive=False)
 
             with gr.Row():
-                bar_avg = gr.BarPlot(x="escala", y="porcentaje", title="Promedio por escala (%)", height=300)
+                bar_avg = gr.BarPlot(x="escala", y="porcentaje", title="Promedio por escala (%)", height=320)
                 bar_per_user = gr.BarPlot(x="nombre", y="porcentaje", color="escala",
-                                        title="Puntajes por usuario y escala (%)", height=300)
+                                        title="Puntajes por usuario y escala (%)", height=320)
+
+            gr.Markdown("#### 🎯 Filtro individual")
+            nombre_select = gr.Dropdown(label="Seleccionar participante", choices=[], interactive=True)
+
+            radar_plot = gr.Plot(label="Perfil motivacional (Radar)")
+            perfil_text = gr.Markdown(label="Interpretación del perfil")
 
             download_file = gr.File(label="Descargar CSV de resultados", visible=False)
-            refresh_btn = gr.Button("Actualizar datos")
+            refresh_btn = gr.Button("🔄 Actualizar datos")
 
         # ======================================================
         #   Login de administrador
@@ -283,21 +289,18 @@ with gr.Blocks(title=TITLE, theme=gr.themes.Soft()) as app:
                     pd.DataFrame(),
                     pd.DataFrame(columns=["escala", "porcentaje"]),
                     pd.DataFrame(columns=["nombre", "escala", "porcentaje"]),
+                    gr.update(choices=[]),
                     gr.update(visible=False, value=None),
                 )
 
-            # Normalizar nombres de columnas
             df.rename(columns={c: c.upper() for c in df.columns if c.startswith(("a", "f", "p"))}, inplace=True)
-
-            # Calcular resultados
             scored, _ = score_df(df)
 
-            # CSV temporal
+            # ✅ Guardar CSV en ruta permitida
             csv_path = os.path.join(os.getcwd(), "resultados_scoring.csv")
-
             scored.to_csv(csv_path, index=False, encoding="utf-8")
 
-            # Agregados
+            # Promedios globales
             avg_summary = aggregate_summary(scored)
             avg_df = avg_summary[avg_summary["metric"].str.endswith("_porc")].rename(columns={"metric": "escala", "value": "porcentaje"})
             per_user_df = scored.melt(
@@ -307,20 +310,60 @@ with gr.Blocks(title=TITLE, theme=gr.themes.Soft()) as app:
                 value_name="porcentaje"
             )
 
+            nombres = sorted(list(scored["nombre"].dropna().unique()))
+
             return (
                 f"✅ {len(df)} respuestas cargadas.",
                 df,
                 scored,
                 avg_df,
                 per_user_df,
+                gr.update(choices=nombres),
                 gr.update(visible=True, value=csv_path),
             )
 
-        enter_btn.click(load_admin_data,
-                        outputs=[admin_status, df_users, df_scored, bar_avg, bar_per_user, download_file])
-        refresh_btn.click(load_admin_data,
-                        outputs=[admin_status, df_users, df_scored, bar_avg, bar_per_user, download_file])
+        enter_btn.click(
+            load_admin_data,
+            outputs=[admin_status, df_users, df_scored, bar_avg, bar_per_user, nombre_select, download_file]
+        )
+        refresh_btn.click(
+            load_admin_data,
+            outputs=[admin_status, df_users, df_scored, bar_avg, bar_per_user, nombre_select, download_file]
+        )
 
+        # ======================================================
+        #   Gráfico radar individual
+        # ======================================================
+        def mostrar_radar(nombre):
+            query = "SELECT * FROM respuestas ORDER BY timestamp_utc DESC;"
+            df = pd.read_sql(query, con=engine)
+            df.rename(columns={c: c.upper() for c in df.columns if c.startswith(("a", "f", "p"))}, inplace=True)
+            scored, _ = score_df(df)
+
+            persona = scored[scored["nombre"] == nombre]
+            if persona.empty:
+                return gr.update(value=None), "No se encontraron datos para esta persona."
+
+            row = persona.iloc[0]
+            categorias = ["Logros", "Afiliación", "Poder"]
+            valores = [row["Logros_media"], row["Afiliación_media"], row["Poder_media"]]
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatterpolar(r=valores, theta=categorias, fill='toself', name=nombre))
+            fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[1, 5])), showlegend=False)
+
+            interpretaciones = {
+                "Logros": "Alta orientación al rendimiento, búsqueda de estándares exigentes y deseo de superación personal.",
+                "Afiliación": "Motivado por las relaciones humanas, el trabajo en equipo y la armonía grupal.",
+                "Poder": "Busca influir, liderar y tener impacto en los demás; disfruta de posiciones de responsabilidad.",
+                "Mixto": "Presenta un equilibrio entre las tres motivaciones sin predominio claro."
+            }
+
+            perfil = row["perfil_dominante"]
+            texto = f"**Perfil dominante:** {perfil}\n\n💬 {interpretaciones.get(perfil, 'Sin interpretación definida.')}"
+            return fig, texto
+
+        nombre_select.change(mostrar_radar, inputs=[nombre_select], outputs=[radar_plot, perfil_text])
 # ==========================
 #   Launcher
 # ==========================
