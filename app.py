@@ -1,27 +1,59 @@
-# /home/jupyter/Motivations_test/app.py
-# Gradio app for 36-item Likert questionnaire (Forma A).
-# Collects: timestamp, name, ID (cédula), A1..A12, F1..F12, P1..P12, and pos_1..pos_36 (display order)
-# Run:
-#   pip install gradio pandas filelock
-#   python app.py --share
-# or:
-#   python app.py --port 7860
+# app.py
+# Gradio + PostgreSQL: Cuestionario (público) + Panel Admin (protegido)
+# Requiere: gradio, pandas, numpy, filelock, psycopg2-binary, sqlalchemy
+# Env vars: PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE, ADMIN_PASSWORD
 
 import os
 import argparse
 from datetime import datetime
 from typing import List, Tuple, Dict, Any
 
+from dotenv import load_dotenv
+load_dotenv()
+
+
 import pandas as pd
-from filelock import FileLock
+import numpy as np
 import gradio as gr
 
-# ---------------- Config ----------------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
-CSV_PATH = os.path.join(DATA_DIR, "respuestas_cuestionario.csv")
-LOCK_PATH = CSV_PATH + ".lock"
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 
+# ==========================
+#   Configuración & DB
+# ==========================
+
+def db_engine_from_env() -> Engine:
+    required = ["PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"]
+    missing = [k for k in required if not os.getenv(k)]
+    if missing:
+        raise RuntimeError(f"Faltan variables de entorno para la BD: {', '.join(missing)}")
+    url = (
+        f"postgresql+psycopg2://{os.getenv('PGUSER')}:{os.getenv('PGPASSWORD')}"
+        f"@{os.getenv('PGHOST')}:{os.getenv('PGPORT')}/{os.getenv('PGDATABASE')}"
+    )
+    return create_engine(url, pool_pre_ping=True)
+
+engine = db_engine_from_env()
+
+# Crear tabla si no existe
+DDL = """
+CREATE TABLE IF NOT EXISTS respuestas (
+    id SERIAL PRIMARY KEY,
+    timestamp_utc TIMESTAMP,
+    nombre TEXT,
+    cedula TEXT,
+    A1 INT, A2 INT, A3 INT, A4 INT, A5 INT, A6 INT, A7 INT, A8 INT, A9 INT, A10 INT, A11 INT, A12 INT,
+    F1 INT, F2 INT, F3 INT, F4 INT, F5 INT, F6 INT, F7 INT, F8 INT, F9 INT, F10 INT, F11 INT, F12 INT,
+    P1 INT, P2 INT, P3 INT, P4 INT, P5 INT, P6 INT, P7 INT, P8 INT, P9 INT, P10 INT, P11 INT, P12 INT
+);
+"""
+with engine.begin() as conn:
+    conn.execute(text(DDL))
+
+# ==========================
+#   Ítems y utilidades
+# ==========================
 
 TITLE = "Cuestionario de Motivaciones (Logros · Afiliación · Poder)"
 INSTRUCCION = (
@@ -30,7 +62,6 @@ INSTRUCCION = (
     "4 = De acuerdo · 5 = Totalmente de acuerdo."
 )
 
-# Same order (Forma A) we agreed
 PREGUNTAS: List[Tuple[int, str, str]] = [
     (1,  "A1",  "Me motiva superar metas desafiantes."),
     (2,  "F4",  "Prefiero trabajar aislado la mayor parte del tiempo."),
@@ -73,37 +104,13 @@ PREGUNTAS: List[Tuple[int, str, str]] = [
 LIKERT_CHOICES = [1, 2, 3, 4, 5]
 LIKERT_HINT = "1=Totalmente en desacuerdo · 5=Totalmente de acuerdo"
 
-# -------------- Helpers ---------------
-def ensure_dirs():
-    os.makedirs(DATA_DIR, exist_ok=True)
+A_COLS = [f"A{i}" for i in range(1, 13)]
+F_COLS = [f"F{i}" for i in range(1, 13)]
+P_COLS = [f"P{i}" for i in range(1, 13)]
 
-def save_row(nombre: str, cedula: str, values: List[Any]) -> str:
-    """
-    values = responses in the same order as PREGUNTAS (36 ints 1..5)
-    """
-    ensure_dirs()
-    ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-    record: Dict[str, Any] = {"timestamp_utc": ts, "nombre": nombre.strip(), "cedula": cedula.strip()}
-
-    # Logical order columns (A1..A12, F1..F12, P1..P12)
-    logical_codes = [f"A{i}" for i in range(1, 13)] + [f"F{i}" for i in range(1, 13)] + [f"P{i}" for i in range(1, 13)]
-    # Initialize all as None
-    for c in logical_codes:
-        record[c] = None
-
-    # Map responses (display order → code)
-    for idx, (pos, codigo, _texto) in enumerate(PREGUNTAS):
-        record[codigo] = int(values[idx]) if values[idx] is not None else None
-        record[f"pos_{pos}"] = codigo  # track the presented order
-
-    df = pd.DataFrame([record])
-
-    # Concurrency-safe append
-    write_header = not os.path.exists(CSV_PATH)
-    with FileLock(LOCK_PATH, timeout=20):
-        df.to_csv(CSV_PATH, mode="a", index=False, header=write_header, encoding="utf-8")
-
-    return CSV_PATH
+# ==========================
+#   Persistencia (DB)
+# ==========================
 
 def validate_inputs(nombre: str, cedula: str, values: List[Any]) -> List[str]:
     errs = []
@@ -111,72 +118,209 @@ def validate_inputs(nombre: str, cedula: str, values: List[Any]) -> List[str]:
         errs.append("El nombre es obligatorio.")
     if not cedula or not cedula.strip():
         errs.append("La cédula/ID es obligatoria.")
-    # Must answer all 36
     if any(v is None for v in values):
         errs.append("Debes responder todas las afirmaciones (1–5).")
     return errs
 
-# -------------- UI / Gradio --------------
-with gr.Blocks(title=TITLE, theme=gr.themes.Soft()) as demo:
+def save_to_db(nombre: str, cedula: str, values: List[Any]) -> None:
+    ts = datetime.utcnow().isoformat(timespec="seconds")
+    logical_codes = A_COLS + F_COLS + P_COLS
+    # Mapear del orden mostrado → columnas lógicas
+    code_to_value: Dict[str, Any] = {}
+    for idx, (_pos, codigo, _texto) in enumerate(PREGUNTAS):
+        code_to_value[codigo] = int(values[idx]) if values[idx] is not None else None
+
+    record: Dict[str, Any] = {"timestamp_utc": ts, "nombre": nombre.strip(), "cedula": cedula.strip()}
+    for c in logical_codes:
+        record[c.lower()] = code_to_value.get(c)
+
+    df = pd.DataFrame([record])
+    df.to_sql("respuestas", con=engine, if_exists="append", index=False)
+
+# ==========================
+#   Scoring (import local)
+# ==========================
+# Usamos tus funciones de score_results.py
+# Asegúrate de que score_results.py esté en el mismo directorio del proyecto.
+from score_results import score_df  # devuelve (scored_df, reliability_dict)
+
+def load_all_from_db() -> pd.DataFrame:
+    q = "SELECT * FROM respuestas ORDER BY timestamp_utc ASC;"
+    return pd.read_sql(q, con=engine)
+
+def build_aggregate_bars(scored: pd.DataFrame) -> pd.DataFrame:
+    """
+    Devuelve un DF 'largo' para gr.BarPlot con promedios de porcentaje por escala.
+    Columnas: escala, porcentaje
+    """
+    cols = ["Logros_porc", "Afiliación_porc", "Poder_porc"]
+    present = [c for c in cols if c in scored.columns]
+    if not present:
+        return pd.DataFrame(columns=["escala", "porcentaje"])
+    means = scored[present].mean(numeric_only=True).round(2)
+    data = pd.DataFrame({"escala": [c.replace("_porc", "") for c in means.index],
+                         "porcentaje": list(means.values)})
+    return data
+
+def build_per_user_bars(scored: pd.DataFrame) -> pd.DataFrame:
+    """
+    DF largo por usuario: nombre, escala, porcentaje
+    """
+    if scored.empty:
+        return pd.DataFrame(columns=["nombre", "escala", "porcentaje"])
+    base_cols = [c for c in ["nombre", "cedula", "timestamp_utc"] if c in scored.columns]
+    cols = [("Logros", "Logros_porc"), ("Afiliación", "Afiliación_porc"), ("Poder", "Poder_porc")]
+    rows = []
+    for _, row in scored.iterrows():
+        for label, col in cols:
+            if col in scored.columns and pd.notna(row[col]):
+                rows.append({
+                    "nombre": row.get("nombre", ""),
+                    "escala": label,
+                    "porcentaje": float(row[col])
+                })
+    return pd.DataFrame(rows)
+
+# ==========================
+#   Interfaz Gradio
+# ==========================
+
+with gr.Blocks(title=TITLE, theme=gr.themes.Soft()) as app:
     gr.Markdown(f"## 📝 {TITLE}")
-    gr.Markdown(INSTRUCCION)
+    with gr.Tab("Cuestionario"):
+        gr.Markdown(INSTRUCCION)
 
-    with gr.Row():
-        nombre = gr.Textbox(label="Nombre completo *", placeholder="Nombre Apellido", scale=1)
-        cedula = gr.Textbox(label="Cédula / ID *", placeholder="12345678", scale=1)
+        with gr.Row():
+            nombre = gr.Textbox(label="Nombre completo *", placeholder="Nombre Apellido", scale=1)
+            cedula = gr.Textbox(label="Cédula / ID *", placeholder="12345678", scale=1)
 
-    gr.Markdown("---")
-    gr.Markdown("### Responde las 36 afirmaciones")
+        gr.Markdown("---")
+        gr.Markdown("### Responde las 36 afirmaciones")
 
-    question_components: List[gr.components.Radio] = []
-    for pos, codigo, texto in PREGUNTAS:
-        comp = gr.Radio(
-            choices=LIKERT_CHOICES,
-            label=f"{pos}. {texto}",
-            info=LIKERT_HINT
+        question_components: List[gr.components.Radio] = []
+        for pos, _codigo, texto in PREGUNTAS:
+            comp = gr.Radio(
+                choices=LIKERT_CHOICES,
+                label=f"{pos}. {texto}",
+                info=LIKERT_HINT
+            )
+            question_components.append(comp)
+
+        with gr.Row():
+            submit_btn = gr.Button("Enviar respuestas", variant="primary")
+            reset_btn = gr.Button("Limpiar formulario")
+
+        status = gr.Markdown()
+
+        def on_submit(nombre_val: str, cedula_val: str, *answers):
+            answers = list(answers)
+            errs = validate_inputs(nombre_val, cedula_val, answers)
+            if errs:
+                return "❌ **Errores:**<br>- " + "<br>- ".join(errs)
+            save_to_db(nombre_val, cedula_val, answers)
+            return "✅ ¡Respuestas guardadas en la base de datos!"
+
+        submit_btn.click(
+            on_submit,
+            inputs=[nombre, cedula] + question_components,
+            outputs=[status]
         )
-        question_components.append(comp)
 
-    with gr.Row():
-        submit_btn = gr.Button("Enviar respuestas", variant="primary")
-        reset_btn = gr.Button("Limpiar formulario")
+        reset_btn.click(
+            lambda: ["", ""] + [None for _ in question_components] + [""],
+            inputs=None,
+            outputs=[nombre, cedula] + question_components + [status],
+        )
 
-    status = gr.Markdown()  # feedback for the user
+    with gr.Tab("Panel Administrativo"):
+        gr.Markdown("### 🔒 Acceso restringido")
+        pwd = gr.Textbox(label="Contraseña de administrador", type="password")
+        enter_btn = gr.Button("Entrar")
+        admin_status = gr.Markdown()
 
-    def on_submit(nombre_val: str, cedula_val: str, *answers):
-        answers = list(answers)
-        errs = validate_inputs(nombre_val, cedula_val, answers)
-        if errs:
-            return f"❌ **Errores:**<br>- " + "<br>- ".join(errs)
+        # Contenedores de datos/plots
+        with gr.Group(visible=False) as admin_block:
+            gr.Markdown("#### 👥 Respuestas registradas")
+            df_users = gr.Dataframe(
+                headers=None, interactive=False, wrap=True, label="Respuestas (raw)"
+            )
 
-        path = save_row(nombre_val, cedula_val, answers)
-        return f"✅ ¡Respuestas guardadas!<br>Archivo: `{path}`"
+            gr.Markdown("#### 📊 Calificaciones (por usuario)")
+            df_scored = gr.Dataframe(
+                headers=None, interactive=False, wrap=True, label="Resultados con puntajes"
+            )
 
-    # Wire the buttons
-    submit_btn.click(
-        on_submit,
-        inputs=[nombre, cedula] + question_components,
-        outputs=[status]
-    )
+            with gr.Row():
+                bar_avg = gr.BarPlot(
+                    x="escala", y="porcentaje", title="Promedio por escala (%)", height=320
+                )
+                bar_per_user = gr.BarPlot(
+                    x="nombre", y="porcentaje", color="escala",
+                    title="Puntajes por usuario y escala (%)", height=320
+                )
 
-    # Reset fields to None / empty
-    reset_btn.click(
-        lambda: ["", ""] + [None for _ in question_components] + [""],
-        inputs=None,
-        outputs=[nombre, cedula] + question_components + [status],
-    )
+            download_file = gr.File(label="Descargar calificaciones (CSV)", visible=False)
+            refresh_btn = gr.Button("Actualizar datos")
 
-# -------------- Launcher ---------------
+        def admin_login(p):
+            admin_pass = os.getenv("ADMIN_PASSWORD", "")
+            if not admin_pass:
+                return "⚠️ Falta configurar ADMIN_PASSWORD en variables de entorno.", gr.update(visible=False)
+            if p != admin_pass:
+                return "❌ Contraseña incorrecta.", gr.update(visible=False)
+            return "✅ Acceso concedido.", gr.update(visible=True)
+
+        enter_btn.click(admin_login, inputs=[pwd], outputs=[admin_status, admin_block])
+
+        def load_admin_data(_evt=None):
+            # Cargar respuestas
+            df = load_all_from_db()
+            if df.empty:
+                # limpiar vistas
+                return (
+                    "No hay respuestas aún.",
+                    gr.update(value=pd.DataFrame()),
+                    gr.update(value=pd.DataFrame()),
+                    gr.update(value=pd.DataFrame(columns=["escala","porcentaje"])),
+                    gr.update(value=pd.DataFrame(columns=["nombre","escala","porcentaje"])),
+                    gr.update(visible=False, value=None),
+                )
+
+            # Calcular puntajes
+            scored, _reliab = score_df(df)
+
+            # CSV temporal para descarga
+            csv_path = "/tmp/resultados_scoring.csv"
+            scored.to_csv(csv_path, index=False, encoding="utf-8")
+
+            # Graficar
+            avg_df = build_aggregate_bars(scored)
+            per_user_df = build_per_user_bars(scored)
+
+            return (
+                f"✅ {len(df)} respuestas cargadas.",
+                df,                         # tabla raw
+                scored,                     # tabla con puntajes
+                avg_df,                     # barras promedio
+                per_user_df,                # barras por usuario
+                gr.update(visible=True, value=csv_path),
+            )
+
+        # Cargar datos al entrar y al refrescar
+        enter_btn.click(load_admin_data, outputs=[admin_status, df_users, df_scored, bar_avg, bar_per_user, download_file])
+        refresh_btn.click(load_admin_data, outputs=[admin_status, df_users, df_scored, bar_avg, bar_per_user, download_file])
+
+# ==========================
+#   Launcher
+# ==========================
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--share", action="store_true", help="Get a public Gradio share link.")
-    parser.add_argument("--port", type=int, default=7860, help="Port to serve on (if not using --share).")
+    parser.add_argument("--port", type=int, default=7860)
     args = parser.parse_args()
 
-    # queue() helps with concurrency (100 users is fine)
-    demo.queue(max_size=128).launch(
-        share=args.share,
-        server_name="0.0.0.0",     # necesario para Railway
-        server_port=int(os.environ.get("PORT", args.port)),  # usa el puerto asignado por Railway
+    app.queue(max_size=128).launch(
+        server_name="0.0.0.0",
+        server_port=int(os.environ.get("PORT", args.port)),
         show_error=True
     )
