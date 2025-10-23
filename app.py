@@ -23,15 +23,13 @@ from sqlalchemy.engine import Engine
 #   Configuración & DB
 # ==========================
 
-def db_engine_from_env() -> Engine:
-    required = ["PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"]
-    missing = [k for k in required if not os.getenv(k)]
-    if missing:
-        raise RuntimeError(f"Faltan variables de entorno para la BD: {', '.join(missing)}")
-    url = (
-        f"postgresql+psycopg2://{os.getenv('PGUSER')}:{os.getenv('PGPASSWORD')}"
-        f"@{os.getenv('PGHOST')}:{os.getenv('PGPORT')}/{os.getenv('PGDATABASE')}"
-    )
+def db_engine_from_env():
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        raise RuntimeError("❌ No se encontró la variable DATABASE_URL en Railway.")
+    # Railway usa formato "postgres://", SQLAlchemy espera "postgresql://"
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
     return create_engine(url, pool_pre_ping=True)
 
 engine = db_engine_from_env()
