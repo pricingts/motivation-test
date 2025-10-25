@@ -88,15 +88,28 @@ def score_df(df: pd.DataFrame):
             if col in scored.columns:
                 scored[col] = reverse_score(pd.to_numeric(scored[col], errors="coerce"))
 
-    # Per-scale means and percents
     results = pd.DataFrame(index=scored.index)
     reliability = {}
+
+    # Calcular medias por escala
     for scale, spec in SUBSCALES.items():
         sub = scored[spec["items"]]
-        mean_scores = sub.mean(axis=1)  # no missing if enforced, robust anyway
+        mean_scores = sub.mean(axis=1)
         results[f"{scale}_media"] = mean_scores
-        results[f"{scale}_porc"] = percent_from_mean(mean_scores)
         reliability[scale] = cronbach_alpha(sub)
+
+    # ===============================
+    #   Calcular porcentajes relativos
+    # ===============================
+    total_media = (
+        results["Logros_media"] +
+        results["Afiliación_media"] +
+        results["Poder_media"]
+    )
+
+    results["Logros_porc"] = (results["Logros_media"] / total_media * 100).round(2)
+    results["Afiliación_porc"] = (results["Afiliación_media"] / total_media * 100).round(2)
+    results["Poder_porc"] = (results["Poder_media"] / total_media * 100).round(2)
 
     # Dominant profile with ties → "Mixto"
     perc_cols = [c for c in results.columns if c.endswith("_porc")]
@@ -110,19 +123,16 @@ def score_df(df: pd.DataFrame):
     results["respuesta_plana_flag"] = person_std < 0.30
     results["aquiescencia"] = scored[ALL_ITEMS].sub(MID).abs().mean(axis=1)
 
-    # Labels (Alta/Moderada/Baja)
+    # Labels (Alta/Moderada/Baja) → puedes mantener si lo deseas o eliminar
     for scale in SUBSCALES.keys():
         results[f"{scale}_nivel"] = results[f"{scale}_porc"].apply(label_from_percent)
-
-    # Round percents
-    for c in perc_cols + ["aquiescencia"]:
-        results[c] = results[c].round(2)
 
     # Bring id columns forward
     id_cols = [c for c in ["timestamp_utc","nombre","cedula"] if c in df.columns]
     out = pd.concat([df[id_cols], results], axis=1)
 
     return out, reliability
+
 
 def aggregate_summary(scored: pd.DataFrame) -> pd.DataFrame:
     # Means of percents and distribution of dominant profile

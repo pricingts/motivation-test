@@ -215,20 +215,32 @@ with gr.Blocks(title=TITLE, theme=gr.themes.Soft()) as app:
             answers = list(answers)
             errs = validate_inputs(nombre_val, cedula_val, answers)
             if errs:
+                # ⚠️ Si hay errores, no desactives el botón
                 return "❌ **Errores:**<br>- " + "<br>- ".join(errs)
             save_to_db(nombre_val, cedula_val, answers)
             return "✅ ¡Respuestas guardadas en la base de datos!"
+
+        def bloquear_si_exito(status_msg: str):
+            # ✅ Solo bloquear si el mensaje indica éxito
+            if status_msg.startswith("✅"):
+                return gr.update(interactive=False)
+            return gr.update(interactive=True)
 
         submit_btn.click(
             on_submit,
             inputs=[nombre, cedula] + question_components,
             outputs=[status]
+        ).then(
+            bloquear_si_exito,
+            inputs=[status],
+            outputs=[submit_btn]
         )
 
+
         reset_btn.click(
-            lambda: ["", ""] + [None for _ in question_components] + [""],
+            lambda: ["", ""] + [None for _ in question_components] + ["", gr.update(interactive=True)],
             inputs=None,
-            outputs=[nombre, cedula] + question_components + [status],
+            outputs=[nombre, cedula] + question_components + [status, submit_btn],
         )
 
     # ==========================================================
@@ -242,16 +254,27 @@ with gr.Blocks(title=TITLE, theme=gr.themes.Soft()) as app:
 
         # Contenedor principal (oculto hasta login correcto)
         with gr.Group(visible=False) as admin_block:
-            gr.Markdown("#### 👥 Respuestas registradas")
-            df_users = gr.Dataframe(label="Respuestas (raw)", wrap=True, interactive=False)
+            # gr.Markdown("#### 👥 Respuestas registradas")
+            # df_users = gr.Dataframe(label="Respuestas (raw)", wrap=True, interactive=False)
 
             gr.Markdown("#### 📊 Calificaciones por usuario")
-            df_scored = gr.Dataframe(label="Resultados con puntajes", wrap=True, interactive=False)
+            df_scored = gr.Dataframe(
+                label="Resultados",
+                interactive=False,
+                wrap=True
+            )
 
-            with gr.Row():
-                bar_avg = gr.BarPlot(x="escala", y="porcentaje", title="Promedio por escala (%)", height=320)
-                bar_per_user = gr.BarPlot(x="nombre", y="porcentaje", color="escala",
-                                        title="Puntajes por usuario y escala (%)", height=320)
+            # with gr.Row():
+            #     bar_avg = gr.BarPlot(
+            #         x="escala", y="porcentaje",
+            #         title="Promedio relativo por escala (%)",
+            #         height=320, color="escala"
+            #     )
+            #     bar_per_user = gr.BarPlot(
+            #         x="nombre", y="porcentaje", color="escala",
+            #         title="Distribución de porcentajes por usuario",
+            #         height=320
+            #     )
 
             gr.Markdown("#### 🎯 Filtro individual")
             nombre_select = gr.Dropdown(label="Seleccionar participante", choices=[], interactive=True)
@@ -293,42 +316,50 @@ with gr.Blocks(title=TITLE, theme=gr.themes.Soft()) as app:
                     gr.update(visible=False, value=None),
                 )
 
+            # Convertir nombres de columnas (a mayúsculas para compatibilidad)
             df.rename(columns={c: c.upper() for c in df.columns if c.startswith(("a", "f", "p"))}, inplace=True)
             scored, _ = score_df(df)
+
+            cols = ["nombre", "Logros_porc", "Afiliación_porc", "Poder_porc", "perfil_dominante"]
+            visible_scored = scored[cols].rename(columns={
+                "nombre": "Nombre",
+                "Logros_porc": "Logros (%)",
+                "Afiliación_porc": "Afiliación (%)",
+                "Poder_porc": "Poder (%)",
+                "perfil_dominante": "Perfil Dominante"
+            })
+
+            for col in ["Logros (%)", "Afiliación (%)", "Poder (%)"]:
+                visible_scored[col] = visible_scored[col].round(2).astype(str) + "%"
 
             # ✅ Guardar CSV en ruta permitida
             csv_path = os.path.join(os.getcwd(), "resultados_scoring.csv")
             scored.to_csv(csv_path, index=False, encoding="utf-8")
 
-            # Promedios globales
+            # ===============================
+            #   Promedios globales
+            # ===============================
             avg_summary = aggregate_summary(scored)
             avg_df = avg_summary[avg_summary["metric"].str.endswith("_porc")].rename(columns={"metric": "escala", "value": "porcentaje"})
-            per_user_df = scored.melt(
-                id_vars=["nombre"],
-                value_vars=["Logros_porc", "Afiliación_porc", "Poder_porc"],
-                var_name="escala",
-                value_name="porcentaje"
-            )
+            avg_df["porcentaje"] = avg_df["porcentaje"].round(2)
+
 
             nombres = sorted(list(scored["nombre"].dropna().unique()))
 
             return (
                 f"✅ {len(df)} respuestas cargadas.",
-                df,
-                scored,
-                avg_df,
-                per_user_df,
+                visible_scored,
                 gr.update(choices=nombres),
                 gr.update(visible=True, value=csv_path),
             )
 
         enter_btn.click(
             load_admin_data,
-            outputs=[admin_status, df_users, df_scored, bar_avg, bar_per_user, nombre_select, download_file]
+            outputs=[admin_status, df_scored, nombre_select, download_file]
         )
         refresh_btn.click(
             load_admin_data,
-            outputs=[admin_status, df_users, df_scored, bar_avg, bar_per_user, nombre_select, download_file]
+            outputs=[admin_status, df_scored, nombre_select, download_file]
         )
 
         # ======================================================
@@ -346,11 +377,15 @@ with gr.Blocks(title=TITLE, theme=gr.themes.Soft()) as app:
 
             row = persona.iloc[0]
             categorias = ["Logros", "Afiliación", "Poder"]
-            valores = [row["Logros_media"], row["Afiliación_media"], row["Poder_media"]]
+            valores = [row["Logros_porc"], row["Afiliación_porc"], row["Poder_porc"]]  # ✅ usar porcentajes relativos
 
             fig = go.Figure()
             fig.add_trace(go.Scatterpolar(r=valores, theta=categorias, fill='toself', name=nombre))
-            fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[1, 5])), showlegend=False)
+            fig.update_layout(
+                polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+                showlegend=False,
+                title="Distribución relativa de motivaciones (%)"
+            )
 
             interpretaciones = {
                 "Logros": "Alta orientación al rendimiento, búsqueda de estándares exigentes y deseo de superación personal.",
@@ -364,6 +399,7 @@ with gr.Blocks(title=TITLE, theme=gr.themes.Soft()) as app:
             return fig, texto
 
         nombre_select.change(mostrar_radar, inputs=[nombre_select], outputs=[radar_plot, perfil_text])
+
 # ==========================
 #   Launcher
 # ==========================
